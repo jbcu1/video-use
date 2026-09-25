@@ -3,6 +3,10 @@
 Walks <videos_dir> for common video extensions, runs ElevenLabs Scribe on
 each, writes transcripts to <videos_dir>/edit/transcripts/<name>.json.
 
+With the local backend (see transcribe.py --backend) the model loads once and
+files run one at a time — it already uses every core, and parallel copies
+would each hold the whole model in memory.
+
 Cached per-file: any source that already has a transcript is skipped.
 
 Usage:
@@ -10,6 +14,7 @@ Usage:
     python helpers/transcribe_batch.py <videos_dir> --workers 4
     python helpers/transcribe_batch.py <videos_dir> --num-speakers 2
     python helpers/transcribe_batch.py <videos_dir> --edit-dir /custom/edit
+    python helpers/transcribe_batch.py <videos_dir> --backend local --language ru
 """
 
 from __future__ import annotations
@@ -20,7 +25,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from transcribe import load_api_key, transcribe_one, transcript_path
+from transcribe import BACKENDS, load_api_key, resolve_backend, transcribe_one, transcript_path
+from transcribe_local import add_local_args, make_local_transcriber
 
 
 VIDEO_EXTS = {".mp4", ".MP4", ".mov", ".MOV", ".mkv", ".MKV", ".avi", ".AVI", ".m4v"}
@@ -62,6 +68,14 @@ def main() -> None:
         default=0,
         help="Zero-based audio track to transcribe (OBS: 0 = game, 1 = mic).",
     )
+    ap.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default="auto",
+        help="elevenlabs = hosted Scribe; local = faster-whisper + pyannote on this "
+             "machine. auto (default) picks elevenlabs when ELEVENLABS_API_KEY is set.",
+    )
+    add_local_args(ap)
     args = ap.parse_args()
 
     videos_dir = args.videos_dir.resolve()
@@ -84,13 +98,17 @@ def main() -> None:
         print("nothing to do")
         return
 
-    api_key = load_api_key()
+    backend = resolve_backend(args.backend)
+    if backend == "local":
+        api_key, engine, workers = None, make_local_transcriber(args, args.num_speakers), 1
+    else:
+        api_key, engine, workers = load_api_key(), None, args.workers
 
-    print(f"transcribing {len(pending)} files with {args.workers} parallel workers")
+    print(f"transcribing {len(pending)} files with {backend}, {workers} parallel worker(s)")
     t0 = time.time()
 
     errors: list[tuple[Path, str]] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
                 transcribe_one,
@@ -101,6 +119,7 @@ def main() -> None:
                 num_speakers=args.num_speakers,
                 verbose=False,
                 audio_track=args.audio_track,
+                engine=engine,
             ): v
             for v in pending
         }

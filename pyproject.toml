@@ -14,6 +14,10 @@ dependencies = [
 
 [project.optional-dependencies]
 animations = ["manim"]
+# Free on-device transcription instead of ElevenLabs: helpers/transcribe_local.py
+local = ["faster-whisper>=1.1"]
+# Speaker diarization for the local backend; needs HF_TOKEN (see transcribe_local.py)
+diarize = ["pyannote.audio>=4.0"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

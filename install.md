@@ -15,7 +15,7 @@ Three things must exist on this machine:
 
 1. The `video-use` repo cloned somewhere stable.
 2. `ffmpeg` on `$PATH` (plus optional `yt-dlp` for online sources).
-3. An ElevenLabs API key in `.env` at the repo root (for Scribe transcription).
+3. An ElevenLabs API key in `.env` at the repo root (for Scribe transcription) — or the free local backend (faster-whisper + pyannote), see step 5b.
 
 And one thing must be true about the current agent:
 
@@ -124,6 +124,21 @@ Scribe (ElevenLabs) does all transcription. Without a key, nothing transcribes.
     ```
 
     `200` means the key works. `401` means the user pasted a wrong/expired key — ask once more and stop. Anything else (network, 5xx), move on and verify during first real transcription.
+
+### 5b. Free local transcription (instead of, or besides, ElevenLabs)
+
+If the user doesn't want a paid service, install the local backend. It runs on this machine and writes transcripts in the same shape as Scribe:
+
+```bash
+cd ~/Developer/video-use
+uv sync --extra local                   # faster-whisper (word timestamps)
+uv sync --extra local --extra diarize   # + pyannote speaker diarization (pulls in PyTorch, several GB)
+```
+
+- The transcribe helpers use it automatically when `ELEVENLABS_API_KEY` is not set. `--backend local` forces it.
+- The first run downloads the Whisper weights from huggingface.co (`large-v3-turbo` by default, ~1.6 GB; `--whisper-model small` is faster on CPU).
+- Diarization needs a Hugging Face token: ask the user to create a read token at https://huggingface.co/settings/tokens and to accept the terms of https://huggingface.co/pyannote/speaker-diarization-community-1 with that account, then write `HF_TOKEN=...` to `~/Developer/video-use/.env` exactly like the ElevenLabs key. Without it transcription still works, just with no speaker labels.
+- Tell the user the trade-offs once: slower than Scribe on CPU, no `(laughter)` / `(applause)` events, and Whisper tends to drop filler words.
 
 ### 6. Verify end-to-end
 

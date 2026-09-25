@@ -30,7 +30,7 @@ Set up https://github.com/browser-use/video-use for me.
 Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and set up the ElevenLabs API key — ask me to paste it when you need it. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
 ```
 
-The agent handles the clone, dependencies, skill registration, and prompts you once for your ElevenLabs API key (grab one at [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)).
+The agent handles the clone, dependencies, skill registration, and prompts you once for your ElevenLabs API key (grab one at [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)). No key? It can transcribe locally for free instead — see [Local transcription](#local-transcription-no-api-key).
 
 Then point your agent at a folder of raw takes:
 
@@ -67,6 +67,21 @@ brew install yt-dlp             # optional, for downloading online sources
 cp .env.example .env
 $EDITOR .env                    # ELEVENLABS_API_KEY=...
 ```
+
+## Local transcription (no API key)
+
+Transcription can run on your own machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for word timestamps and [pyannote](https://github.com/pyannote/pyannote-audio) for speaker diarization. It writes the same transcript format as Scribe, so the rest of the pipeline is unchanged.
+
+```bash
+uv sync --extra local --extra diarize     # or: pip install -e '.[local,diarize]'
+echo 'HF_TOKEN=hf_...' >> .env            # optional, for speaker labels
+python helpers/transcribe_batch.py /path/to/videos --backend local --language en
+```
+
+- Used automatically when `ELEVENLABS_API_KEY` is not set; `--backend local` forces it.
+- `--whisper-model` picks the model (default `large-v3-turbo`; `small` is faster on CPU). Weights download from huggingface.co on first use.
+- Diarization needs a Hugging Face read token and accepting the terms of [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1). Without it you get no speaker labels. `--no-diarize` skips it; `--num-speakers 1` skips it too.
+- Trade-offs vs. Scribe: slower on CPU, no audio events (`(laughter)`), and Whisper tends to drop filler words. `--whisper-prompt "Umm, so, uh, like..."` (in your footage's language) brings most of them back.
 
 ## How it works
 
