@@ -1,8 +1,13 @@
-"""Transcribe a video with ElevenLabs Scribe.
+"""Transcribe a video with ElevenLabs Scribe or a local Whisper model.
 
 Extracts mono 16kHz audio via ffmpeg, uploads to Scribe with verbatim +
 diarize + audio events + word-level timestamps, writes the full response
 to <edit_dir>/transcripts/<video_stem>.json.
+
+`--backend local` runs faster-whisper (+ pyannote diarization) on this
+machine instead and writes the same shape — see transcribe_local.py. The
+default, `auto`, uses Scribe when ELEVENLABS_API_KEY resolves and the local
+backend otherwise.
 
 Cached: if the output file already exists, the upload is skipped.
 
@@ -11,6 +16,7 @@ Usage:
     python helpers/transcribe.py <video_path> --edit-dir /custom/edit
     python helpers/transcribe.py <video_path> --language en
     python helpers/transcribe.py <video_path> --num-speakers 2
+    python helpers/transcribe.py <video_path> --backend local --whisper-model small
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import tempfile
 import time
 import wave
 from pathlib import Path
+from typing import Callable
 
 import requests
 
@@ -33,7 +40,14 @@ import requests
 SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 
-def load_api_key() -> str:
+BACKENDS = ("auto", "elevenlabs", "local")
+
+# Takes (audio_path, language, num_speakers), returns a Scribe-shaped transcript dict.
+Engine = Callable[[Path, "str | None", "int | None"], dict]
+
+
+def read_env_value(name: str) -> str:
+    """A setting from .env (repo root, then cwd) or the environment. "" if unset."""
     for candidate in [Path(__file__).resolve().parent.parent / ".env", Path(".env")]:
         if candidate.exists():
             for line in candidate.read_text().splitlines():
@@ -41,12 +55,26 @@ def load_api_key() -> str:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                if k.strip() == "ELEVENLABS_API_KEY":
-                    return v.strip().strip('"').strip("'")
-    v = os.environ.get("ELEVENLABS_API_KEY", "")
+                if k.strip() == name:
+                    v = v.strip().strip('"').strip("'")
+                    if v:
+                        return v
+    return os.environ.get(name, "")
+
+
+def load_api_key() -> str:
+    v = read_env_value("ELEVENLABS_API_KEY")
     if not v:
-        sys.exit("ELEVENLABS_API_KEY not found in .env or environment")
+        sys.exit("ELEVENLABS_API_KEY not found in .env or environment "
+                 "(or use --backend local for free on-device transcription)")
     return v
+
+
+def resolve_backend(backend: str) -> str:
+    """`auto` means Scribe when a key is configured, the local model otherwise."""
+    if backend != "auto":
+        return backend
+    return "elevenlabs" if read_env_value("ELEVENLABS_API_KEY") else "local"
 
 
 def count_audio_tracks(video_path: Path) -> int:
@@ -128,13 +156,17 @@ def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
 def transcribe_one(
     video: Path,
     edit_dir: Path,
-    api_key: str,
+    api_key: str | None,
     language: str | None = None,
     num_speakers: int | None = None,
     verbose: bool = True,
     audio_track: int = 0,
+    engine: Engine | None = None,
 ) -> Path:
     """Transcribe a single video. Returns path to transcript JSON.
+
+    `engine` replaces the Scribe upload (e.g. a transcribe_local.LocalTranscriber);
+    `api_key` is only needed when `engine` is None.
 
     Cached: returns existing path immediately if the transcript already exists.
     """
@@ -166,7 +198,7 @@ def transcribe_one(
         if peak < -60.0:
             raise RuntimeError(
                 f"track {audio_track + 1} of {video.name} is silent "
-                f"(peak {peak:.1f} dBFS) - not uploading. "
+                f"(peak {peak:.1f} dBFS) - not transcribing. "
                 + (f"The file has {n_tracks} audio tracks; try --audio-track "
                    + " or ".join(str(i) for i in range(n_tracks) if i != audio_track) + "."
                    if n_tracks > 1 else "Check the source audio.")
@@ -174,8 +206,12 @@ def transcribe_one(
 
         size_mb = audio.stat().st_size / (1024 * 1024)
         if verbose:
-            print(f"  uploading {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
-        payload = call_scribe(audio, api_key, language, num_speakers)
+            verb = "uploading" if engine is None else "transcribing locally"
+            print(f"  {verb} {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
+        if engine is None:
+            payload = call_scribe(audio, api_key, language, num_speakers)
+        else:
+            payload = engine(audio, language, num_speakers)
 
     out_path.write_text(json.dumps(payload, indent=2))
     dt = time.time() - t0
@@ -190,7 +226,7 @@ def transcribe_one(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcribe a video with ElevenLabs Scribe")
+    ap = argparse.ArgumentParser(description="Transcribe a video with ElevenLabs Scribe or local Whisper")
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
         "--edit-dir",
@@ -218,6 +254,16 @@ def main() -> None:
              "and the mic on track 1; without this ffmpeg applies its default audio "
              "stream selection, which picks the track with the most channels.",
     )
+    ap.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default="auto",
+        help="elevenlabs = hosted Scribe; local = faster-whisper + pyannote on this "
+             "machine. auto (default) picks elevenlabs when ELEVENLABS_API_KEY is set.",
+    )
+    # Imported here: transcribe_local imports this module, so a top-level import would be circular.
+    from transcribe_local import add_local_args, make_local_transcriber
+    add_local_args(ap)
     args = ap.parse_args()
 
     video = args.video.resolve()
@@ -225,7 +271,15 @@ def main() -> None:
         sys.exit(f"video not found: {video}")
 
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
-    api_key = load_api_key()
+    if transcript_path(edit_dir, video, args.audio_track).exists():
+        # Cached: don't load a model or demand a key just to report that.
+        transcribe_one(video, edit_dir, None, audio_track=args.audio_track)
+        return
+
+    backend = resolve_backend(args.backend)
+    print(f"backend: {backend}")
+    api_key = load_api_key() if backend == "elevenlabs" else None
+    engine = make_local_transcriber(args, args.num_speakers) if backend == "local" else None
 
     transcribe_one(
         video=video,
@@ -234,6 +288,7 @@ def main() -> None:
         language=args.language,
         num_speakers=args.num_speakers,
         audio_track=args.audio_track,
+        engine=engine,
     )
 
 
