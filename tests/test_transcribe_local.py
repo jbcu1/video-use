@@ -44,6 +44,48 @@ class AssignSpeakersTests(unittest.TestCase):
         self.assertNotIn("speaker_id", words[0])
 
 
+class ClampToSpeechTests(unittest.TestCase):
+    def test_start_drifted_into_the_pause_moves_to_the_speech(self):
+        # What faster-whisper `small` wrote for a 0.9 s pause (speech resumes at
+        # 4.45): "the" swallowed it whole, so no silence was left between the words.
+        words = [word("speaker.", 3.0, 3.39), word("the", 3.39, 4.51), word("weather", 4.6, 4.95)]
+        transcribe_local.clamp_to_speech(words, [(0.5, 3.49), (4.45, 4.95)], margin=0.12)
+        self.assertEqual([(w["start"], w["end"]) for w in words],
+                         [(3.0, 3.49), (4.33, 4.51), (4.6, 4.95)])
+        phrases = pack_transcripts.group_into_phrases(
+            transcribe_local.with_spacing(words), silence_threshold=0.5)
+        self.assertEqual([p["text"] for p in phrases], ["speaker.", "the weather"])
+
+    def test_end_drifted_into_the_pause_moves_back(self):
+        words = [word("flow.", 5.2, 6.3)]  # speech stops at 5.73
+        transcribe_local.clamp_to_speech(words, [(3.0, 5.73), (6.6, 7.0)], margin=0.12)
+        self.assertEqual((words[0]["start"], words[0]["end"]), (5.2, 5.85))
+
+    def test_last_word_before_a_pause_ends_with_its_speech(self):
+        words = [word("this", 19.9, 20.1), word("afternoon.", 21.3, 21.83), word("Bye.", 23.0, 23.3)]
+        transcribe_local.clamp_to_speech(
+            words, [(19.39, 22.24), (23.0, 30.0)], margin=0.12, max_extend=0.5)
+        # "this" is followed by speech in its own region and keeps its end; the
+        # region's last word grows to the region's end, but never by more than 0.5 s.
+        self.assertEqual([(w["start"], w["end"]) for w in words],
+                         [(19.9, 20.1), (21.3, 22.24), (23.0, 23.8)])
+
+    def test_edges_within_the_margin_and_words_spanning_regions_keep_their_times(self):
+        # "product" spans a stop-consonant gap between two regions; "hm" is
+        # quiet speech the VAD missed.
+        words = [word("the", 0.40, 0.6), word("product", 1.0, 1.6), word("launch", 1.7, 1.95),
+                 word("hm", 3.0, 3.2)]
+        transcribe_local.clamp_to_speech(
+            words, [(0.5, 1.2), (1.3, 1.55), (1.58, 1.95)], margin=0.12)
+        self.assertEqual([(w["start"], w["end"]) for w in words],
+                         [(0.40, 0.6), (1.0, 1.6), (1.7, 1.95), (3.0, 3.2)])
+
+    def test_no_regions_is_a_no_op(self):
+        words = [word("hi", 0.0, 0.4)]
+        transcribe_local.clamp_to_speech(words, [])
+        self.assertEqual((words[0]["start"], words[0]["end"]), (0.0, 0.4))
+
+
 class ScribeShapeTests(unittest.TestCase):
     def test_spacing_between_every_pair_carries_the_gap_and_speaker(self):
         words = [word("a", 0.0, 0.5, speaker_id="speaker_0"),
@@ -110,8 +152,9 @@ class FakeWhisper:
 class FakeTranscriber(transcribe_local.LocalTranscriber):
     """LocalTranscriber with the models swapped out; diarize() returns fixed turns."""
 
-    def __init__(self, turns=None):
+    def __init__(self, turns=None, regions=()):
         self.model = FakeWhisper()
+        self.regions = list(regions)
         self.model_name = "fake"
         self.prompt = "Umm, uh."
         self.verbose = False
@@ -120,6 +163,9 @@ class FakeTranscriber(transcribe_local.LocalTranscriber):
 
     def diarize(self, audio_path, num_speakers):
         return self.turns
+
+    def speech_regions(self, audio_path):
+        return self.regions
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
@@ -164,6 +210,18 @@ class TranscribeOneLocalTests(unittest.TestCase):
         self.assertFalse(any("speaker_id" in w for w in data["words"]))
         phrases = pack_transcripts.group_into_phrases(data["words"], silence_threshold=0.5)
         self.assertEqual([p["text"] for p in phrases], ["Hello there.", "Hi back."])
+
+    def test_word_edges_are_clamped_to_speech_before_speakers_are_assigned(self):
+        # Speech resumes at 1.95, but Whisper started "Hi" at 1.8.
+        engine = FakeTranscriber(turns=[(0.0, 1.9, "A"), (1.9, 2.6, "B")],
+                                 regions=[(0.2, 0.9), (1.95, 2.4)])
+        _, data = self.run_engine(engine)
+        hi = next(w for w in data["words"] if w["text"] == "Hi")
+        self.assertEqual((hi["start"], hi["end"]), (1.83, 2.0))
+        gap = data["words"][data["words"].index(hi) - 1]
+        self.assertEqual((gap["type"], gap["start"], gap["end"]), ("spacing", 0.9, 1.83))
+        # 1.8-2.0 overlapped A and B equally; 1.83-2.0 is mostly B.
+        self.assertEqual(hi["speaker_id"], "speaker_1")
 
     def test_one_known_speaker_skips_diarization(self):
         engine = FakeTranscriber(turns=[(0.0, 1.0, "A"), (1.5, 2.6, "B")])

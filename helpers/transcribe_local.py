@@ -26,6 +26,7 @@ Install: `uv sync --extra local` (Whisper only) or
 from __future__ import annotations
 
 import argparse
+import bisect
 import sys
 import wave
 from pathlib import Path
@@ -35,6 +36,18 @@ from transcribe import read_env_value
 
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+
+# Silero settings for trimming word edges (not for choosing what Whisper hears):
+# no padding, so the regions hug the speech, and split only on pauses of 200 ms
+# or more, so a stop consonant's closure does not split a word.
+SPEECH_VAD = {"min_silence_duration_ms": 200, "speech_pad_ms": 0}
+# Silero opens a region 50-120 ms into a soft onset ("s", "sh", "f"), so a word
+# may start this far ahead of its region before it counts as drifted.
+SPEECH_MARGIN = 0.12
+# Whisper also ends the last word before a pause early — "afternoon." by 0.4 s,
+# which an 80 ms cut pad then clips. Such a word's end may grow this much toward
+# the end of its speech region; more would swallow speech Whisper did not transcribe.
+SPEECH_MAX_EXTEND = 0.5
 
 
 # -------- Scribe-shaped output ------------------------------------------------
@@ -69,6 +82,56 @@ def assign_speakers(
             mid = (ws + we) / 2
             best = min(turns, key=lambda t: max(t[0] - mid, mid - t[1], 0.0))[2]
         w["speaker_id"] = names[best]
+    return words
+
+
+def clamp_to_speech(
+    words: list[dict],
+    regions: list[tuple[float, float]],
+    margin: float = SPEECH_MARGIN,
+    max_extend: float = SPEECH_MAX_EXTEND,
+) -> list[dict]:
+    """Pull word edges out of the silence around them.
+
+    Whisper's alignment starts the first word after a pause inside the pause —
+    by 0.4 s with faster-whisper's VAD padding, by the whole pause with `small`
+    — so the silence vanishes from `spacing`, pack_transcripts stops breaking
+    phrases there and a cut at that word keeps dead air. Word ends are the
+    more reliable edge, so each word is anchored to the speech region its end
+    falls in: its end comes back to `margin` after that region, and its start
+    moves up to `margin` before it when what the word covers ahead of the
+    region is mostly silence. The last word of a region ends where the region
+    does (by up to `max_extend`), since Whisper cuts it short. A word that
+    overlaps no region (quiet speech the VAD missed) is left alone.
+
+    `regions` are sorted, non-overlapping (start, end) speech spans from a VAD.
+    """
+    if not regions:
+        return words
+    starts = [r[0] for r in regions]
+    anchored: list[tuple[int, float]] = []  # (word index, end of its region)
+    for k, w in enumerate(words):
+        ws, we = w["start"], w["end"]
+        i = bisect.bisect_left(starts, we) - 1  # last region starting before the word ends
+        if i < 0 or regions[i][1] <= ws:
+            continue
+        rs, re_ = regions[i]
+        w["end"] = round(min(we, re_ + margin), 3)
+        ahead = rs - ws
+        if ahead > margin:
+            speech, j = 0.0, i - 1
+            while j >= 0 and regions[j][1] > ws:
+                speech += regions[j][1] - max(regions[j][0], ws)
+                j -= 1
+            if speech < ahead / 2:
+                w["start"] = round(rs - margin, 3)
+        anchored.append((k, re_))
+    # After the starts have moved: a word is its region's last when the next one starts past it.
+    for k, re_ in anchored:
+        w = words[k]
+        nxt = words[k + 1]["start"] if k + 1 < len(words) else float("inf")
+        if nxt >= re_ and w["end"] < re_:
+            w["end"] = round(min(re_, w["end"] + max_extend), 3)
     return words
 
 
@@ -193,6 +256,13 @@ class LocalTranscriber:
             pipeline.to(torch.device("cuda"))
         return pipeline
 
+    def speech_regions(self, audio_path: Path) -> list[tuple[float, float]]:
+        """(start, end) seconds of speech per Silero VAD, which faster-whisper ships."""
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        samples, sr = load_wav(audio_path)
+        spans = get_speech_timestamps(samples, VadOptions(**SPEECH_VAD), sampling_rate=sr)
+        return [(s["start"] / sr, s["end"] / sr) for s in spans]
+
     def diarize(self, audio_path: Path, num_speakers: int | None) -> list[tuple[float, float, str]]:
         import torch
         samples, sr = load_wav(audio_path)
@@ -218,6 +288,8 @@ class LocalTranscriber:
             initial_prompt=self.prompt,
         )
         words = whisper_words(segments)
+        if words:
+            clamp_to_speech(words, self.speech_regions(audio_path))
 
         diarized = False
         if self.diarizer is not None and num_speakers != 1 and words:
